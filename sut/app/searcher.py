@@ -1,207 +1,147 @@
 """
-Модуль поиска. Реализует два режима:
-- Конфигурация А: Dense-only (только векторный поиск)
-- Конфигурация Б: Hybrid RRF (векторный + BM25 + слияние в Python)
+Поисковый движок. Две конфигурации:
+  - search_dense_only  — Конфигурация А (только dense)
+  - search_hybrid_rrf  — Конфигурация Б (dense + sparse, слияние RRF в Python)
+
+Все замеры времени делаются здесь, в SUT, чтобы в latency входила
+именно логика поиска (а не сетевые задержки до клиента).
 """
+
+import os
 import time
 from typing import List, Dict, Tuple
+
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
-    ScoredPoint,
-    SparseVector,
-    SparseIndexParams,
-    SparseVectorParams,
     Distance,
-    VectorParams,
     PointStruct,
+    SparseIndexParams,
+    SparseVector,
+    SparseVectorParams,
+    VectorParams,
 )
+
 from app.embedder import Embedder
 
 
 class Searcher:
-    """
-    Поисковый движок. Обёртка над Qdrant для выполнения поиска
-    в двух режимах.
-    """
+    COLLECTION = "documents"
 
-    def __init__(self, embedder: Embedder, host: str = "localhost", port: int = 6333):
+    def __init__(self, embedder: Embedder):
+        host = os.getenv("QDRANT_HOST", "localhost")
+        port = int(os.getenv("QDRANT_PORT", "6333"))
+        print(f"[Searcher] Подключение к Qdrant {host}:{port}")
         self.embedder = embedder
-        self.client = QdrantClient(host=host, port=port)
-        self.collection_name = "documents"
+        self.client = QdrantClient(host=host, port=port, timeout=30)
 
-    def create_collection(self):
-        """Создаёт коллекцию в Qdrant."""
-        if self.client.collection_exists(self.collection_name):
-            print(f"[Searcher] Коллекция '{self.collection_name}' уже существует. Удаляю...")
-            self.client.delete_collection(self.collection_name)
+    # ---------- подготовка ----------
 
-        print(f"[Searcher] Создаю коллекцию '{self.collection_name}'...")
-        self.client.create_collection(
-            collection_name=self.collection_name,
-            vectors_config={
-                "dense": VectorParams(
-                    size=self.embedder.dim,
-                    distance=Distance.COSINE,
-                )
-            },
-            sparse_vectors_config={
-                "sparse": SparseVectorParams(
-                    index=SparseIndexParams()
-                )
-            },
-        )
-        print("[Searcher] Коллекция создана.")
+    def create_collection(self, recreate: bool = True):
+        exists = self.client.collection_exists(self.COLLECTION)
+        if exists and recreate:
+            print(f"[Searcher] Удаляю существующую коллекцию {self.COLLECTION}")
+            self.client.delete_collection(self.COLLECTION)
+        if not exists or recreate:
+            self.client.create_collection(
+                collection_name=self.COLLECTION,
+                vectors_config={
+                    "dense": VectorParams(size=self.embedder.dim, distance=Distance.COSINE)
+                },
+                sparse_vectors_config={
+                    "sparse": SparseVectorParams(index=SparseIndexParams())
+                },
+            )
+            print(f"[Searcher] Коллекция {self.COLLECTION} создана")
 
-    def index_documents(self, documents: List[Dict]):
-        """Индексирует документы в Qdrant."""
-        print(f"[Searcher] Индексирую {len(documents)} документов...")
+    def index_documents(self, docs: List[Dict], batch_size: int = 64):
+        print(f"[Searcher] Индексация {len(docs)} документов")
+        texts = [d["text"] for d in docs]
+        dense_vectors = self.embedder.encode_batch(texts, prefix="passage")
+
         points = []
-
-        for i, doc in enumerate(documents):
-            if (i + 1) % 100 == 0:
-                print(f"  Прогресс: {i + 1}/{len(documents)} документов...")
-
-            dense_vector = self.embedder.encode_for_indexing(doc["text"])
+        for i, doc in enumerate(docs):
             sparse_vector = self._text_to_sparse_vector(doc["text"])
-
-            point = PointStruct(
-                id=doc["id"],
-                vector={
-                    "dense": dense_vector,
-                    "sparse": sparse_vector,
-                },
-                payload={
-                    "text": doc["text"],
-                    "doc_id": doc["id"],
-                },
-            )
-            points.append(point)
-
-            if len(points) >= 100:
-                self.client.upsert(
-                    collection_name=self.collection_name,
-                    points=points,
-                    wait=True,
+            points.append(
+                PointStruct(
+                    id=doc["id"],
+                    vector={
+                        "dense": dense_vectors[i].tolist(),
+                        "sparse": sparse_vector,
+                    },
+                    payload={"text": doc["text"], "doc_id": doc["id"]},
                 )
-                points = []
-
-        if points:
-            self.client.upsert(
-                collection_name=self.collection_name,
-                points=points,
-                wait=True,
             )
 
-        print(f"[Searcher] Индексация завершена. Загружено {len(documents)} документов.")
+        for i in range(0, len(points), batch_size):
+            batch = points[i : i + batch_size]
+            self.client.upsert(collection_name=self.COLLECTION, points=batch, wait=True)
+            print(f"  upsert {i + len(batch)}/{len(points)}")
+        print("[Searcher] Индексация завершена")
+
+    # ---------- поиск ----------
 
     def search_dense_only(self, query: str, top_k: int = 5) -> Tuple[List[Dict], float]:
-        """КОНФИГУРАЦИЯ А: Только плотный (семантический) поиск."""
-        start_time = time.perf_counter()
-
-        query_vector = self.embedder.encode(query)
-
-        results = self.client.query_points(
-            collection_name=self.collection_name,
-            query=query_vector,
+        t0 = time.perf_counter()
+        qvec = self.embedder.encode_query(query)
+        res = self.client.query_points(
+            collection_name=self.COLLECTION,
+            query=qvec,
             limit=top_k,
             using="dense",
         )
+        elapsed = (time.perf_counter() - t0) * 1000
+        return self._format(res.points), elapsed
 
-        elapsed_ms = (time.perf_counter() - start_time) * 1000
-
-        return self._format_results(results.points), elapsed_ms
-
-    def search_hybrid_rrf(self, query: str, top_k: int = 5) -> Tuple[List[Dict], float]:
-        """КОНФИГУРАЦИЯ Б: Гибридный поиск с RRF-слиянием."""
-        start_time = time.perf_counter()
-
-        query_vector = self.embedder.encode(query)
-
-        # Dense поиск
-        dense_results = self.client.query_points(
-            collection_name=self.collection_name,
-            query=query_vector,
-            limit=20,
-            using="dense",
+    def search_hybrid_rrf(self, query: str, top_k: int = 5, candidates: int = 20) -> Tuple[List[Dict], float]:
+        t0 = time.perf_counter()
+        qvec = self.embedder.encode_query(query)
+        dense_res = self.client.query_points(
+            collection_name=self.COLLECTION, query=qvec, limit=candidates, using="dense"
         )
-
-        # Sparse (BM25) поиск
-        sparse_vector = self._text_to_sparse_vector(query)
-        sparse_results = self.client.query_points(
-            collection_name=self.collection_name,
-            query=sparse_vector,
-            limit=20,
-            using="sparse",
+        sparse_vec = self._text_to_sparse_vector(query)
+        sparse_res = self.client.query_points(
+            collection_name=self.COLLECTION, query=sparse_vec, limit=candidates, using="sparse"
         )
+        merged = self._rrf(dense_res.points, sparse_res.points, k=60)
+        merged_sorted = sorted(merged, key=lambda x: x["score"], reverse=True)[:top_k]
+        elapsed = (time.perf_counter() - t0) * 1000
+        return merged_sorted, elapsed
 
-        # RRF-слияние
-        merged = self._rrf_fusion(dense_results.points, sparse_results.points, k=60)
+    # ---------- утилиты ----------
 
-        final_results = sorted(merged, key=lambda x: x["score"], reverse=True)[:top_k]
-
-        elapsed_ms = (time.perf_counter() - start_time) * 1000
-
-        return final_results, elapsed_ms
-
-    def _text_to_sparse_vector(self, text: str) -> SparseVector:
-        """Создаёт sparse вектор из текста."""
-        words = text.lower().split()
-        word_counts = {}
-        for word in words:
-            word_id = abs(hash(word)) % 1000000
-            word_counts[word_id] = word_counts.get(word_id, 0) + 1
-
+    @staticmethod
+    def _text_to_sparse_vector(text: str) -> SparseVector:
+        """Простой sparse: TF по хэшу слов (без IDF — как в НИР 2)."""
+        word_counts: Dict[int, float] = {}
+        for word in text.lower().split():
+            wid = abs(hash(word)) % 1_000_000
+            word_counts[wid] = word_counts.get(wid, 0.0) + 1.0
         indices = list(word_counts.keys())
-        values = [float(v) for v in word_counts.values()]
-
+        values = [word_counts[i] for i in indices]
         return SparseVector(indices=indices, values=values)
 
-    def _rrf_fusion(
-        self,
-        dense_results: List[ScoredPoint],
-        sparse_results: List[ScoredPoint],
-        k: int = 60,
-    ) -> List[Dict]:
-        """RRF-слияние."""
-        scores = {}
-        docs_info = {}
+    @staticmethod
+    def _rrf(dense, sparse, k: int = 60) -> List[Dict]:
+        scores: Dict[int, float] = {}
+        info: Dict[int, Dict] = {}
+        for rank, doc in enumerate(dense, start=1):
+            scores[doc.id] = scores.get(doc.id, 0.0) + 1.0 / (k + rank)
+            info.setdefault(doc.id, {"id": doc.id, "text": (doc.payload or {}).get("text", "")})
+        for rank, doc in enumerate(sparse, start=1):
+            scores[doc.id] = scores.get(doc.id, 0.0) + 1.0 / (k + rank)
+            info.setdefault(doc.id, {"id": doc.id, "text": (doc.payload or {}).get("text", "")})
+        out = []
+        for doc_id, s in scores.items():
+            out.append({"id": info[doc_id]["id"], "text": info[doc_id]["text"], "score": round(s, 6)})
+        return out
 
-        for rank, doc in enumerate(dense_results, start=1):
-            doc_id = doc.id
-            scores[doc_id] = scores.get(doc_id, 0) + 1.0 / (k + rank)
-            if doc_id not in docs_info:
-                docs_info[doc_id] = {
-                    "id": doc_id,
-                    "text": doc.payload.get("text", "") if doc.payload else "",
-                }
-
-        for rank, doc in enumerate(sparse_results, start=1):
-            doc_id = doc.id
-            scores[doc_id] = scores.get(doc_id, 0) + 1.0 / (k + rank)
-            if doc_id not in docs_info:
-                docs_info[doc_id] = {
-                    "id": doc_id,
-                    "text": doc.payload.get("text", "") if doc.payload else "",
-                }
-
-        results = []
-        for doc_id, rrf_score in scores.items():
-            info = docs_info[doc_id]
-            results.append({
-                "id": info["id"],
-                "text": info["text"],
-                "score": round(rrf_score, 4),
-            })
-
-        return results
-
-    def _format_results(self, qdrant_results: List[ScoredPoint]) -> List[Dict]:
-        """Форматирует ответ Qdrant."""
-        formatted = []
-        for doc in qdrant_results:
-            formatted.append({
-                "id": doc.id,
-                "text": doc.payload.get("text", "") if doc.payload else "",
-                "score": round(doc.score, 4),
-            })
-        return formatted
+    @staticmethod
+    def _format(points) -> List[Dict]:
+        return [
+            {
+                "id": p.id,
+                "text": (p.payload or {}).get("text", ""),
+                "score": round(float(p.score), 6),
+            }
+            for p in points
+        ]

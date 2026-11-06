@@ -1,0 +1,33 @@
+# configs/experiment.yaml
+# Центральный конфиг эксперимента ПР4.
+# Все параметры прогонов читаются отсюда, чтобы не хардкодить их в скриптах.
+
+experiment:
+  name: dense-vs-hybrid-rrf
+  seed: 20261023             # сид для рандомизации порядка и bootstrap
+  repetitions: 10            # повторов на каждую конфигурацию (ПР4: ≥5, ориентир 10)
+  warmup_queries: 3          # прогрев перед каждым прогоном (в анализ не идёт)
+  randomize_order: true      # перемешивать порядок прогонов
+  timeout_s: 30              # таймаут одного HTTP-запроса
+
+factors:
+  impl: [dense, hybrid_rrf]  # уровни независимой переменной
+
+data:
+  documents: data/documents_500.json
+  queries: data/queries_50.json
+  top_k: 5                   # K в Recall@K
+
+sut:
+  base_url: http://localhost:8000
+  qdrant_host: localhost
+  qdrant_port: 6333
+
+paths:
+  results_raw: experiment/results/raw
+  results_processed: experiment/results/processed
+  figures: docs/img
+
+analysis:
+  bootstrap_n: 2000
+  alpha: 0.05                # уровень значимости

@@ -1,0 +1,37 @@
+# docker-compose.yml
+# Все компоненты стенда в контейнерах с фиксированными версиями и лимитами.
+# Клиент (run_experiment.py) работает на хосте — не конкурирует с SUT за CPU.
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.10.0
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: "2g"
+
+  sut:
+    build:
+      context: ./sut
+    ports:
+      - "8000:8000"
+    environment:
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: "6333"
+    depends_on:
+      - qdrant
+    volumes:
+      - ./data:/app/data:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: "2g"
+
+volumes:
+  qdrant_storage:

@@ -1,24 +1,28 @@
 # Python
 __pycache__/
 *.pyc
+*.pyo
 .venv/
 venv/
 
-# Data & Results
-experiment/results/raw/*
+# Сырые данные (тяжёлые) — не коммитим
+experiment/results/raw/*.json
 !experiment/results/raw/.gitkeep
+
+# Сгенерированные графики — не коммитим (их пересоздаёт make plot)
 docs/img/*.png
 !docs/img/.gitkeep
 
-# Docker
-*.log
+# DOCX/PDF — опционально
+docs/*.docx
+docs/*.pdf
 
-# IDE
+# OS/IDE
+.DS_Store
 .vscode/
 .idea/
 
-# OS
-.DS_Store
-
 # Env
 .env
+
+.gitignore
